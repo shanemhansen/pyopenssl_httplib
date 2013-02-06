@@ -9,6 +9,7 @@
 """
 __all__ = ["HTTPSConnection"]
 
+import sys
 import socket
 
 from httplib import HTTPConnection, HTTPS_PORT
@@ -18,6 +19,11 @@ try:
     __all__.append("HTTPSConnectionPool")
 except ImportError:
     urllib3 = None
+
+try:
+    import gevent.socket
+except ImportError:
+    gevent = None
 
 
 class HTTPSConnection(HTTPConnection):
@@ -60,7 +66,11 @@ class HTTPSConnection(HTTPConnection):
         """
         sock = socket.create_connection((self.host, self.port),
                                         self.timeout, self.source_address)
+        #not beautiful, detect if we are running with gevent sockets and
+        #support them.
         self.sock = Connection(self.ssl_ctx, sock)
+        if isinstance(sock, gevent.socket.socket):
+            self.sock = GeventSSLConnection(self.sock)
         self.sock.set_connect_state()  # pylint:disable-msg=E1101
 
     def close(self):
@@ -90,8 +100,54 @@ class Connection(object):
         return getattr(self._conn, attr)
 
     def makefile(self, *args):
-        return socket._fileobject(self._conn,  # pylint:disable-msg=W0212
+        return socket._fileobject(self,  # pylint:disable-msg=W0212
                                   *args)
+
+if gevent is not None:
+    class GeventSSLConnection(object):
+        """
+        Wrapper around Connection which handles non-blocking pyopenssl
+        errors. See gevent.sslold. I/O operations that return WantRead or
+        WantWrite are retried until they succeed or raise some other exception.
+        """
+        __slots__ = ["_conn"]
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, attr):
+            return getattr(self._conn, attr)
+
+        def handleSSLErrors(self, method, *args, **kwargs):
+            while True:
+                try:
+                    return method(*args, **kwargs)
+                except SSL.WantReadError:
+                    sys.exc_clear()
+                    gevent.socket.wait_read(self.fileno())
+                except SSL.WantWriteError:
+                    sys.exc_clear()
+                    gevent.socket.wait_write(self.fileno())
+
+        def recv(self, *args, **kwargs):
+            return self.handleSSLErrors(
+                self._conn.recv, *args, **kwargs)
+
+        def readline(self, *args, **kwargs):
+            return self.handleSSLErrors(
+                self._conn.readline, *args, **kwargs)
+
+        def send(self, *args, **kwargs):
+            return self.handleSSLErrors(
+                self._conn.send, *args, **kwargs)
+
+        def sendall(self, *args, **kwargs):
+            return self.handleSSLErrors(
+                self._conn.sendall, *args, **kwargs)
+
+        def makefile(self, *args):
+            return GeventSSLConnection(self._conn.makefile(*args))
+
 
 if urllib3 is not None:
 
